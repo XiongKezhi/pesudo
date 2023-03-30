@@ -213,7 +213,7 @@ void Raft::handleDiffEpochRpc(msg) {
 			} else {
 				// From higher epoch: reject with our own epoch,
 				// Vote for higher epoch can impede progress to commit the transaction
-				// during merge, see corner case <>
+				// during merge.
 				sendRpc(type=RequestVoteResp, to=msg.from, epoch=this.epoch,
 					term=this.term, voteGranted=false)
 			}
@@ -254,11 +254,11 @@ void Raft::handleDiffEpochRpc(msg) {
 				becomeFollower()
 			}
 		case AppendEntriesResp:
-			if this.role != LEADER {
-				return
-			}
-
-			if msg.epoch < this.epoch {
+			if msg.epoch < this.epoch {	
+				if this.role != LEADER {
+					return
+				}
+			
 				// From lower epoch: handle as normal raft.
 				if msg.success {
 					this.matchIndex[this.nextIndex[msg.from]]

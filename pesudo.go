@@ -28,7 +28,7 @@ void Raft::handleUserRequest(req) {
 			this.logs.append(Entry{type: SplitEnterJoint, configs: req.cfgs, prev: this.cfg})
 
 		case SplitLeaveRequest: // A request to leave joint consensus for spliting
-			if (in joint config) && (the SplitEnterJoint entry is committed) {
+			if (currently in joint config for spliting) && (the SplitEnterJoint entry is committed) {
 				// this.cfg: current config
 				this.logs.append(Entry{type: SplitLeaveJoint, prev: this.cfg})
 			}
@@ -75,23 +75,29 @@ void Raft::handleLogChanges(change) {
 				case SplitEnterJoint:
 					applyConfig(entry.configs)
 				case SplitLeaveJoint:
-					applyConfig(in current joint configs, the one containing this node)
+					applyConfig(in the current joint config, the sub-config containing this node)
 			}
 
-			for node in this.config {
-				sendRpc(type=AppendEntries, to=node, entry=entry, ...) 
+			if this.role == LEADER {
+				for node in this.config {
+					sendRpc(type=AppendEntries, to=node, entry=entry, ...) 
+				}
 			}
 
 		case Commit:
 		 	switch entry.type {
 				case Proposal:
 					applyProposal(entry.proposal)
+				case SplitEnterJoint:
+					// automatically issue leave joint request
+					this.log.append(Entry{type: SplitLeaveJoint, prev: this.cfg})
 				case SplitLeaveJoint:
 					this.epoch = entry.epoch+1
 				case MergePrepare:
+					// start of 2-phase commit for merging
 					registered := true
 					if (no ongoing merge) {
-						// register and store the tx info somewhere
+						// register and store the tx info
 						storeTx(req.txid, entry)
 					} else {
 						registered = false
@@ -101,7 +107,7 @@ void Raft::handleLogChanges(change) {
 						if registered {
 							// if this cluster is the tx coordinator
 							// and successfully register the tx,
-							// send prepare message to other clusters
+							// send first phase prepare message to other clusters
 							for clr in entry.clusters {
 								if clr == this.config {
 									continue
@@ -184,9 +190,8 @@ void Raft::handleLogChanges(change) {
 					}
 			}
 
-		case Overwritten: // A log entry is overwritten
-			if entry.type == SplitEnterjoint ||
-				entry.type == SplitLeaveJoint {
+		case Overwritten: // The log entry is overwritten
+			if entry.type == SplitEnterjoint || entry.type == SplitLeaveJoint {
 				// recover to previous config
 				applyConfig(entry.prev)
 			}
@@ -197,7 +202,7 @@ void Raft::handleRaftRpc(msg) {
 	if msg.epoch != this.epoch {
 		handleDiffEpochRpc(msg)
 	} else {
-		handleSamEpochRpc(msg)
+		handleSameEpochRpc(msg)
 	}
 }
 
@@ -208,47 +213,41 @@ void Raft::handleDiffEpochRpc(msg) {
 			if msg.epoch < this.epoch {
 				// From lower epoch: reject with our own epoch,
 				// so the candidate will know it was out-of-date.
-				sendRpc(type=RequestVoteResp, to=msg.from, epoch=this.epoch,
-					term=this.term, voteGranted=false)
+				sendRpc(type=RequestVoteResp, to=msg.from, epoch=this.epoch, term=this.term, voteGranted=false)
 			} else {
 				// From higher epoch: reject with our own epoch,
-				// Vote for higher epoch can impede progress to commit the transaction
-				// during merge.
-				sendRpc(type=RequestVoteResp, to=msg.from, epoch=this.epoch,
-					term=this.term, voteGranted=false)
+				// If vote for higher epoch,
+				// it can impact the transaction commit during merge.
+				sendRpc(type=RequestVoteResp, to=msg.from, epoch=this.epoch, term=this.term, voteGranted=false)
 			}
 		case RequestVoteResp:
 			if msg.epoch < this.epoch {
 				// From lower epoch: ignore, out-of-date response.
 			} else {
 				// From higher epoch: rejected due to higher epoch,
-				// so we can trigger pull entries RPC.
-				sendRpc(type=PullEntries, to=msg.from, epoch=this.epoch,
-					term=this.term, pullFromIndex=this.commitIndex+1)
+				// so we should trigger pull entries RPC.
+				sendRpc(type=PullEntries, to=msg.from, epoch=this.epoch, term=this.term, pullFromIndex=this.commitIndex+1)
 				becomeFollower()
 			}
 
 		case AppendEntries:
 			if msg.epoch < this.epoch {
 				// From lower epoch: reject with our own epoch,
-				sendRpc(type=AppendEntriesResp, to=msg.from, epoch=this.epoch,
-					term=this.term, success=false)
+				sendRpc(type=AppendEntriesResp, to=msg.from, epoch=this.epoch, term=this.term, success=false)
 			} else {
-				// From higher epoch: accept based on prev-log match rule (the original raft way).
+				// From higher epoch: accept based on prev-log match rule (same as the original raft).
 				// When an `AppendEntries` rpc is issued from a higher epoch, meaning a leader
 				// has been elected there, then this node must be a delayed one.
 				entry := this.logs.getByIndex(msg.prevLogIndex)
 				if entry.epoch == msg.prevLogEpoch && entry.term == msg.prevLogTerm {
-					conflictIndex := conflictIndex between logs in this node and msg
+					conflictIndex := conflict index between logs in this node and msg
 					this.logs.removeSince(conflictIndex)
 					this.logs.append(msg.entries)
 					this.commitIndex = max(msg.leaderCommit, this.commitIndex)
 
-					sendRpc(type=AppendEntriesResp, to=msg.from, epoch=this.epoch,
-						term=this.term, success=true)
+					sendRpc(type=AppendEntriesResp, to=msg.from, epoch=this.epoch, term=this.term, success=true)
 				} else {
-					sendRpc(type=AppendEntriesResp, to=msg.from, epoch=this.epoch,
-						term=this.term, success=true)
+					sendRpc(type=AppendEntriesResp, to=msg.from, epoch=this.epoch, term=this.term, success=true)
 				}
 
 				becomeFollower()
@@ -256,6 +255,7 @@ void Raft::handleDiffEpochRpc(msg) {
 		case AppendEntriesResp:
 			if msg.epoch < this.epoch {	
 				if this.role != LEADER {
+					// if no longer a leader, do nothing
 					return
 				}
 			
@@ -267,10 +267,10 @@ void Raft::handleDiffEpochRpc(msg) {
 						2. log.getByIndex(N).term == currentTerm) {
 						oldCommitIndex = this.commitIndex
 						this.commitIndex = N
-						commitEntries(this.logs.getBetween(oldCommitIndex, this.commitIndex))
+						commitEntries()
 					}
 				} else {
-					if this.nextIndex[msg.from] > this.snapshotIndex { // send logs
+					if this.nextIndex[msg.from] > this.snapshotIndex { // send logs if we still have those logs
 						this.nextIndex[msg.from] -= 1
 						prevLog := this.log.getByIndex(this.nextIndex[msg.from] - 1)
 						sendRpc(type=AppendEntries, to=msg.from, 
@@ -282,8 +282,8 @@ void Raft::handleDiffEpochRpc(msg) {
 					}
 				}
 			} else {
-				// From higher epoch: happens in one case, this node is a stale leader in
-				// a stale epoch.
+				// From higher epoch: happens when this node is a stale leader in a stale epoch.
+				// Then we need to pull entries.
 				sendRpc(type=PullEntries, to=msg.from, epoch=this.epoch,
 					term=this.term, pullFromIndex=this.commitIndex+1)
 				becomeFollower()
@@ -291,15 +291,12 @@ void Raft::handleDiffEpochRpc(msg) {
 
 		case PullEntries:
 			if msg.epoch < this.epoch {
-				// From lower epoch: send logs or snapshot (if compacted).
-				if msg.pullFromIndex < this.logs[0].index { // some logs have been compacted
-					sendRpc(type=PullEntriesResp, to=msg.from, epoch=this.epoch,
-						term=this.term, snapshot=this.snapshot)
-					break
+				// From lower epoch: send logs or snapshot (if logs are compacted).
+				if msg.pullFromIndex < this.logs[0].index { // some logs have been compacted, send snapshot
+					sendRpc(type=PullEntriesResp, to=msg.from, epoch=this.epoch, term=this.term, snapshot=this.snapshot)
+				} else {
+					sendRpc(type=PullEntriesResp, to=msg.from, epoch=this.epoch, term=this.term, entries=this.logs.getBetween(msg.pullInexFrom, this.committedIndex))
 				}
-				
-				sendRpc(type=PullEntriesResp, to=msg.from, epoch=this.epoch,
-					term=this.term, entries=this.logs.getBetween(msg.pullInexFrom, this.committedIndex))
 			} else {
 				// From higher epoch: impossible
 				panic()
@@ -312,13 +309,13 @@ void Raft::handleDiffEpochRpc(msg) {
 				if msg.snapshot != null {
 					applySnapshot(msg.snapsot)
 				} else {
-					conflictIndex := conflictIndex between logs in this node and msg
+					conflictIndex := confliect index between logs in this node and msg
 					this.logs.removeSince(conflictIndex)
 					this.logs.append(msg.entries)
 					
 					oldCommitIndex := this.commitIndex
 					this.commitIndex = msg.entries[len(msg.entries)-1].index
-					commitEntries(this.logs.getBetween(oldCommitIndex, this.commitIndex))
+					commitEntries()
 				}
 			}
 
